@@ -18,7 +18,7 @@ jobs:
       - name: Checkout mt6895 kernel source (xaga)
         uses: actions/checkout@v4
         with:
-          repository: OWNER/android_kernel_xiaomi_mt6895
+          repository: joel27/android_kernel_xiaomi_mt6895
           ref: 16.2-rebase
           fetch-depth: 1
 
@@ -103,7 +103,7 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             KBUILD_BUILD_TIMESTAMP="$(date -u +'%a %b %d %H:%M:%S UTC %Y')" \
             KBUILD_BUILD_USER="builder" \
-            KBUILD_BUILD_HOST="esk" \
+            KBUILD_BUILD_HOST="Tech" \
             Image modules 2>&1 | tee build.log
 
       # Igual que antes: no sabemos todavía si vas a necesitar estos .ko o
