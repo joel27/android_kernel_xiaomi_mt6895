@@ -1,0 +1,195 @@
+name: Tech-Kernel mt6895/xaga (Clean, sin root — test Infinity X)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    env:
+      CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
+      CCACHE_NOHASHDIR: "true"
+      CCACHE_HARDLINK: "true"
+      CCACHE_DIR: /home/runner/.ccache
+
+    steps:
+      # Mismo placeholder de siempre — reemplazá OWNER por el dueño real
+      # del repo mt6895 (el que ya venís usando en tus corridas exitosas).
+      - name: Checkout mt6895 kernel source (xaga)
+        uses: actions/checkout@v4
+        with:
+          repository: OWNER/android_kernel_xiaomi_mt6895
+          ref: 16.2-rebase
+          fetch-depth: 1
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ${{ runner.os }}-ccache-mt6895-clean-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-ccache-mt6895-clean-
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            git make bc bison flex libssl-dev \
+            libelf-dev python3 ccache \
+            gcc-aarch64-linux-gnu zstd lld llvm-14
+
+      - name: Setup Clang r584948b
+        run: |
+          mkdir -p clang
+          curl -L -o clang.tar.gz \
+            "https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r584948b-14726520/clang-r584948b.tar.gz"
+          tar -xzf clang.tar.gz -C clang
+          echo "$PWD/clang/bin" >> $GITHUB_PATH
+          sudo ln -sf /usr/bin/llvm-ar-14      /usr/bin/llvm-ar
+          sudo ln -sf /usr/bin/llvm-nm-14      /usr/bin/llvm-nm
+          sudo ln -sf /usr/bin/llvm-objcopy-14 /usr/bin/llvm-objcopy
+          sudo ln -sf /usr/bin/llvm-objdump-14 /usr/bin/llvm-objdump
+          sudo ln -sf /usr/bin/llvm-strip-14   /usr/bin/llvm-strip
+          clang --version
+          ld.lld --version
+          ccache --version
+
+      - name: Clean build tree
+        run: |
+          rm -rf out
+          rm -f .config .config.old
+          rm -rf include/config include/generated
+
+      - name: Prepare out dir
+        run: mkdir -p out
+
+      # Esto sí se mantiene: es específico del hardware (xaga/mt6895), no
+      # tiene nada que ver con root. Ya está confirmado que reproduce el
+      # mismo merge que tu build exitosa de esk_builder.
+      - name: Merge device defconfig fragments (gki + xiaomi_mt6895 + xaga)
+        run: |
+          scripts/kconfig/merge_config.sh -O out -m \
+            arch/arm64/configs/gki_defconfig \
+            arch/arm64/configs/vendor/xiaomi_mt6895.config \
+            arch/arm64/configs/vendor/xaga.config
+
+      - name: Configure kernel
+        run: |
+          ./scripts/config --file out/.config \
+            --enable  CONFIG_LTO_CLANG \
+            --enable  CONFIG_LTO_CLANG_THIN \
+            --disable CONFIG_LTO_CLANG_FULL \
+            --enable  CONFIG_PSTORE \
+            --enable  CONFIG_PSTORE_RAM \
+            --enable  CONFIG_PSTORE_CONSOLE \
+            --enable  CONFIG_TCP_CONG_BBR \
+            --set-str CONFIG_SYSTEM_TRUSTED_KEYS "" \
+            --set-str CONFIG_SYSTEM_EXTRA_CERTIFICATE "" \
+            --disable CONFIG_SYSTEM_EXTRA_CERTIFICATE \
+            --disable CONFIG_INTEGRITY_SIGNATURE \
+            --disable CONFIG_IMA_APPRAISE
+
+      - name: Finalize config
+        run: |
+          make O=out ARCH=arm64 \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            olddefconfig
+
+      - name: Build kernel (Image + modules)
+        run: |
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            KBUILD_BUILD_TIMESTAMP="$(date -u +'%a %b %d %H:%M:%S UTC %Y')" \
+            KBUILD_BUILD_USER="builder" \
+            KBUILD_BUILD_HOST="esk" \
+            Image modules 2>&1 | tee build.log
+
+      # Igual que antes: no sabemos todavía si vas a necesitar estos .ko o
+      # si el vendor_dlkm de Infinity X ya cubre el hardware. Los guardamos
+      # aparte como artifact de referencia, sin meterlos en el zip
+      # flasheable — así el primer test es lo más simple posible.
+      - name: Install modules to staging (referencia, no se flashea todavía)
+        run: |
+          rm -rf modules_staging
+          mkdir -p modules_staging
+          make -j$(nproc) O=out ARCH=arm64 \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$PWD/modules_staging" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install
+          mkdir -p modules_flat
+          find modules_staging -name "*.ko" -exec cp -f {} modules_flat/ \;
+          echo "Módulos generados: $(ls modules_flat | wc -l)"
+          zip -r9 -q modules-reference.zip modules_flat
+
+      - name: Package AnyKernel3 (boot-only)
+        run: |
+          git clone --depth=1 \
+            https://github.com/ESK-Project/AnyKernel3.git \
+            -b generic AnyKernel3
+          rm -rf AnyKernel3/config AnyKernel3/modules \
+                 AnyKernel3/patch  AnyKernel3/ramdisk
+          cp out/arch/arm64/boot/Image AnyKernel3/Image
+          zstd -19 --no-progress -q \
+            -o AnyKernel3/Image.zst AnyKernel3/Image
+          rm AnyKernel3/Image
+          cd AnyKernel3
+          sha256sum Image.zst > Image.zst.sha256
+          printf '%s\n' \
+            "properties() { '" \
+            'kernel.string=Tech-Kernel mt6895/xaga | Clean (sin root) | test Infinity X' \
+            'do.devicecheck=0' \
+            'do.modules=0' \
+            'do.systemless=0' \
+            'do.cleanup=1' \
+            'do.cleanuponabort=0' \
+            'supported.versions=' \
+            "'; }" \
+            'BLOCK=boot' \
+            'IS_SLOT_DEVICE=1' \
+            'RAMDISK_COMPRESSION=auto' \
+            'PATCH_VBMETA_FLAG=auto' \
+            'NO_MAGISK_CHECK=true' \
+            '. tools/ak3-core.sh' \
+            'ui_print "****************************************"' \
+            'ui_print "  Tech-Kernel mt6895/xaga - Clean (test) "' \
+            'ui_print "  boot-only, sin modulos vendor_dlkm      "' \
+            'ui_print "****************************************"' \
+            '"$BIN/busybox" sha256sum -cs Image.zst.sha256 || abort "[!] SHA256 mismatch"' \
+            '"$BIN/zstd" -d -q --no-progress -o "$AKHOME/Image" "$AKHOME/Image.zst" || abort "[!] Decompress failed"' \
+            'split_boot' \
+            'if [ -f "$SPLITIMG/ramdisk.cpio" ]; then' \
+            '  unpack_ramdisk; write_boot' \
+            'else' \
+            '  flash_boot' \
+            'fi' \
+            'rm -f "$AKHOME/Image"' \
+            > anykernel.sh
+          cd ..
+          cd AnyKernel3
+          zip -r9 ../Tech-Kernel-mt6895-xaga-Clean.zip . \
+            -x ".git*" -x "*.md"
+
+      - name: Upload kernel zip
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Tech-Kernel-mt6895-xaga-Clean
+          path: Tech-Kernel-mt6895-xaga-Clean.zip
+
+      - name: Upload modules reference (no flasheable, solo consulta)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-reference-mt6895
+          path: modules-reference.zip
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-mt6895-clean
+          path: build.log
