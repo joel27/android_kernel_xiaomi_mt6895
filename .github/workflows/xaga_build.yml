@@ -118,6 +118,40 @@ jobs:
           find modules_staging -name "*.ko" -exec cp -f {} modules_flat/ \;
           echo "Módulos generados: $(ls modules_flat | wc -l)"
 
+      # Basado en el vendor_dlkm_fs_config/file_contexts reales del árbol
+      # ESK (mismo formato uniforme: 0 0 0644 para .ko, 0 0 0755 para
+      # carpetas). file_contexts es genérico por patrón, se usa tal cual.
+      # fs_config se regenera con la lista de módulos que ESTE build
+      # realmente produjo, no la lista fija de referencia.
+      - name: Generate vendor_dlkm fs_config / file_contexts
+        run: |
+          mkdir -p vdlkm_config
+
+          cat > vdlkm_config/vendor_dlkm_file_contexts << 'FC_EOF'
+          / u:object_r:vendor_file:s0
+          /vendor_dlkm/etc(/.*)? u:object_r:vendor_configs_file:s0
+          /vendor_dlkm(/.*)? u:object_r:vendor_file:s0
+          FC_EOF
+
+          {
+            echo "/ 0 0 0755"
+            echo "/lost+found 0 0 0755"
+            echo "vendor_dlkm 0 0 0755"
+            echo "vendor_dlkm/etc 0 0 0755"
+            echo "vendor_dlkm/etc/NOTICE.xml.gz 0 0 0644"
+            echo "vendor_dlkm/etc/build.prop 0 0 0644"
+            echo "vendor_dlkm/etc/fs_config_dirs 0 0 0644"
+            echo "vendor_dlkm/etc/fs_config_files 0 0 0644"
+            echo "vendor_dlkm/lib 0 0 0755"
+            echo "vendor_dlkm/lib/modules 0 0 0755"
+            for ko in $(ls modules_flat | sort); do
+              echo "vendor_dlkm/lib/modules/${ko} 0 0 0644"
+            done
+          } > vdlkm_config/vendor_dlkm_fs_config
+
+          echo "fs_config generado con $(ls modules_flat | wc -l) módulos:"
+          wc -l vdlkm_config/vendor_dlkm_fs_config
+
       - name: Build module.tar.xz (vendor_dlkm)
         run: |
           mkdir -p module_pkg/vendor_dlkm/lib/modules
@@ -139,6 +173,9 @@ jobs:
             -o AnyKernel3/Image.zst AnyKernel3/Image
           rm AnyKernel3/Image
           cp module.tar.xz AnyKernel3/module.tar.xz
+          mkdir -p AnyKernel3/config
+          cp vdlkm_config/vendor_dlkm_fs_config AnyKernel3/config/
+          cp vdlkm_config/vendor_dlkm_file_contexts AnyKernel3/config/
 
           cat > AnyKernel3/anykernel.sh << 'ANYKERNEL_EOF'
           ### AnyKernel3 Ramdisk Mod Script
@@ -226,14 +263,12 @@ jobs:
                   abort "[!] Failed to unpack the vendor_dlkm image"
               sync
 
-              # NOTA: a diferencia del script original de ESK, NO se borran ni
-              # reemplazan vendor_dlkm_fs_config / vendor_dlkm_file_contexts. Se
-              # reutilizan los que ya trae tu vendor_dlkm actual (recien extraidos
-              # arriba). Si no estan, se aborta sin tocar nada mas.
-              if [ ! -f "${extract_vendor_dlkm_dir}/config/vendor_dlkm_fs_config" ] ||
-                 [ ! -f "${extract_vendor_dlkm_dir}/config/vendor_dlkm_file_contexts" ]; then
-                  abort "[!] No se encontraron fs_config/file_contexts en el vendor_dlkm actual - abortando"
-              fi
+              # Reemplazamos fs_config/file_contexts por los que trae este
+              # zip (generados a partir del vendor_dlkm_fs_config/
+              # file_contexts reales del arbol ESK, con la lista de modulos
+              # actualizada a lo que este build compilo).
+              rm -f "${extract_vendor_dlkm_dir}"/config/vendor_dlkm_fs_config "${extract_vendor_dlkm_dir}"/config/vendor_dlkm_file_contexts ||
+                  abort "[!] Failed to remove pre-existing fs_config and file_contexts"
 
               ui_print "- [*] Updating /vendor_dlkm modules..."
               extract_vendor_dlkm_modules_dir=${extract_vendor_dlkm_dir}/vendor_dlkm/lib/modules
@@ -241,6 +276,8 @@ jobs:
                   abort "[!] Failed to remove pre-existing files in ${extract_vendor_dlkm_modules_dir}"
               cp -a "$module_extract_dir/vendor_dlkm/lib/modules/." "${extract_vendor_dlkm_modules_dir}/" ||
                   abort "[!] Failed to copy vendor_dlkm modules"
+              mv "${AKHOME}"/config/vendor_dlkm* "${extract_vendor_dlkm_dir}"/config/ ||
+                  abort "[!] Failed to move fs_config and file_contexts to ${extract_vendor_dlkm_dir}/config"
 
               ui_print "- [*] Repacking /vendor_dlkm image..."
               rm -f "${AKHOME}"/vendor_dlkm.img ||
